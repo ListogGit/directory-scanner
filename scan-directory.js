@@ -1,13 +1,14 @@
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const readline = require('readline');
 
-const R = '\x1b[31m';
-const G = '\x1b[32m';
-const Y = '\x1b[33m';
-const B = '\x1b[34m';
-const C = '\x1b[36m';
-const X = '\x1b[0m';
+// --- НАСТРОЙКИ КОНСОЛИ И ЦВЕТА ---
+const R = '\x1b[31m'; const G = '\x1b[32m'; const Y = '\x1b[33m';
+const B = '\x1b[34m'; const M = '\x1b[35m'; const C = '\x1b[36m';
+const W = '\x1b[37m'; const X = '\x1b[0m';
+
+const HISTORY_FILE = path.join(__dirname, '.report_history.json');
 
 const rl = readline.createInterface({
     input: process.stdin,
@@ -15,188 +16,77 @@ const rl = readline.createInterface({
 });
 
 const CONFIG = {
+    // Папки, которые полностью игнорируем
     EXCLUDE_DIRS: [
         'node_modules', '.git', 'dist', 'build', '.svn', '.hg',
         '.cache', '__pycache__', 'venv', '.venv', 'env', 'target',
         'out', 'coverage', '.next', '.nuxt', '.output', '.idea',
-        '.vscode', '__MACOSX'
+        '.vscode', '__MACOSX', 'addons', '.godot', 'obj', 'PNG'
     ],
 
-    COLLAPSE_DIRS: ['.godot'],
+    COLLAPSE_DIRS: [],
 
+    // Файлы, которые даже не показываем в дереве
+    IGNORE_FILES_ENDING: ['.import'],
+
+    // Файлы, которые показываем в дереве, но НЕ читаем содержимое
     IGNORE_CONTENT_EXT: [
         '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg',
         '.mp3', '.wav', '.ogg', '.mp4', '.avi', '.mov',
-        '.zip', '.rar', '.tar', '.gz', '.7z',
-        '.exe', '.dll', '.so', '.dylib',
+        '.zip', '.rar', '.tar', '.gz', '.7z', '.pck', '.apk',
+        '.exe', '.dll', '.so', '.dylib', '.bin', '.dat',
         '.pdf', '.doc', '.docx', '.xls', '.xlsx',
-        '.ctex', '.md5', '.scn', '.res', '.import',
-        '.tres', '.tscn', '.mesh', '.cfg', '.uid',
-        '.mtl', '.glb', '.obj', '.tres'
+        '.ctex', '.md5', '.scn', '.res',
+        '.mesh', '.uid', '.mtl', '.glb', '.obj', '.fbx',
+        '.ttf', '.otf', '.woff', '.woff2', '.eot', '.blend',
+        '.tres', '.material' // Игнорируем материалы и темы
     ],
 
     TEXT_EXTENSIONS: {
-        code: ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
-        '.go', '.rs', '.swift', '.kt', '.dart', '.php', '.rb', '.pl', '.lua',
-        '.cs', '.vb', '.gd'],
-        config: ['.json', '.yaml', '.yml', '.toml', '.xml', '.ini', '.cfg', '.conf',
-        '.properties', '.env', '.editorconfig', '.gitignore', '.gitattributes'],
-        markup: ['.html', '.htm', '.css', '.scss', '.sass', '.less',
-        '.md', '.markdown', '.rst', '.txt'],
-        scripts: ['.sh', '.bash', '.zsh', '.ps1', '.bat', '.cmd'],
-        data: ['.sql', '.graphql', '.gql', '.proto', '.csv', '.tsv']
+        code: ['.js', '.ts', '.py', '.gd', '.shader', '.glsl'],
+        config: ['.json', '.yaml', '.yml', '.toml', '.xml', '.ini', '.cfg', '.conf'],
+        markup: ['.html', '.css', '.md', '.txt', '.tscn', '.godot'],
+        scripts: ['.sh', '.bat', '.cmd'],
+        data: ['.csv']
     },
 
-    MAX_FILE_SIZE: 512 * 1024,
-    MAX_LINES: 500,
-    MIN_FILE_SIZE_SHOW: 100,
-    GROUP_BY_TYPE: true,
-    SHOW_SUMMARY: true,
-    MAX_DEPTH: 20,
-    BATCH_SIZE: 50
+    MAX_FILE_SIZE_CODE: 2 * 1024 * 1024, // 2MB
+    MAX_LINES_CODE: 5000,
+    MAX_LINE_LENGTH: 150,
+    MIN_FILE_SIZE_SHOW: 10,
+    MAX_DEPTH: 20
 };
 
-function resetStats() {
-    return {
-        files: { total: 0, byType: {} },
-        dirs: { total: 0 },
-        size: 0,
-        fileTypes: new Set(),
-        projectType: 'Неизвестный',
-        engineInfo: {},
-        codeFiles: 0,
-        configFiles: 0,
-        assetFiles: 0,
-        ignoredFiles: 0,
-        linesOfCode: 0,
-        scanDuration: 0,
-        scannedFiles: 0,
-        scannedDirs: 0,
-        scannedSymlinks: 0
-    };
-}
+// Глобальная переменная для статистики, но теперь мы будем ее обнулять при каждом старте
+let projectStats;
 
-let projectStats = resetStats();
-const fileCache = new Map();
-const statsCache = new Map();
-
-async function getFileStats(filePath) {
-    if (statsCache.has(filePath)) {
-        return statsCache.get(filePath);
-    }
-
+// --- ФУНКЦИИ ИСТОРИИ ПУТЕЙ ---
+async function loadHistory() {
     try {
-        const stats = await fs.stat(filePath);
-        const result = {
-            type: stats.isDirectory() ? 'DIR' : stats.isFile() ? 'FILE' :
-            stats.isSymbolicLink() ? 'SYMLINK' : 'OTHER',
-            size: stats.size,
-            permissions: stats.mode.toString(8).slice(-3),
-            modified: stats.mtime.toISOString().split('T')[0]
-        };
-        statsCache.set(filePath, result);
-        return result;
-    } catch (error) {
-        const result = { error: error.message };
-        statsCache.set(filePath, result);
-        return result;
-    }
+        if (fsSync.existsSync(HISTORY_FILE)) {
+            const data = await fs.readFile(HISTORY_FILE, 'utf8');
+            return JSON.parse(data);
+        }
+    } catch (e) { /* Игнорируем ошибку чтения */ }
+    return [];
 }
 
-function getFileType(fileName) {
-    const ext = path.extname(fileName).toLowerCase();
-    const baseName = path.basename(fileName).toLowerCase();
-
-    if (baseName === 'dockerfile') return 'config';
-    if (baseName === 'makefile') return 'config';
-    if (baseName === 'readme.md' || baseName === 'license') return 'markup';
-
-    for (const [category, exts] of Object.entries(CONFIG.TEXT_EXTENSIONS)) {
-        if (exts.includes(ext)) return category;
-    }
-
-    if (CONFIG.IGNORE_CONTENT_EXT.includes(ext)) return 'binary';
-
-    return 'other';
-}
-
-// Унифицированное чтение с кэшированием
-async function readFileContentAndCount(filePath) {
-    if (fileCache.has(filePath)) {
-        return fileCache.get(filePath);
-    }
-
+async function saveHistory(historyArray) {
     try {
-        const content = await fs.readFile(filePath, 'utf8');
-        const lines = content.split('\n');
-        const nonEmptyLines = lines.filter(line => line.trim().length > 0).length;
-
-        const result = { content, lineCount: nonEmptyLines };
-        fileCache.set(filePath, result);
-        return result;
-    } catch {
-        const result = { content: '[Ошибка чтения файла]', lineCount: 0 };
-        fileCache.set(filePath, result);
-        return result;
-    }
+        await fs.writeFile(HISTORY_FILE, JSON.stringify(historyArray, null, 2), 'utf8');
+    } catch (e) { console.log(`${R}Не удалось сохранить историю путей.${X}`); }
 }
 
-function detectProjectType(files) {
-    const fileSet = new Set(files.map(f => path.basename(f).toLowerCase()));
-
-    if (fileSet.has('project.godot') || files.some(f => f.endsWith('.gd'))) return 'Godot';
-    if (fileSet.has('package.json')) return 'Node.js';
-    if (fileSet.has('requirements.txt') || fileSet.has('setup.py') || fileSet.has('pyproject.toml')) return 'Python';
-    if (fileSet.has('cargo.toml')) return 'Rust';
-    if (fileSet.has('pom.xml') || fileSet.has('build.gradle')) return 'Java';
-    if (files.some(f => f.endsWith('.csproj'))) return '.NET';
-    if (fileSet.has('composer.json')) return 'PHP';
-    if (fileSet.has('go.mod')) return 'Go';
-    if (files.some(f => f.endsWith('.cpp') || f.endsWith('.c') || f.endsWith('.h'))) return 'C/C++';
-    if (fileSet.has('gemfile')) return 'Ruby';
-    if (files.some(f => f.endsWith('.swift'))) return 'Swift';
-    if (files.some(f => f.endsWith('.kt') || f.endsWith('.kts'))) return 'Kotlin';
-
-    return 'Неизвестный';
+function addToHistory(historyArray, newPath) {
+    const absolutePath = path.resolve(newPath);
+    // Удаляем, если уже есть, чтобы переместить наверх
+    historyArray = historyArray.filter(p => p !== absolutePath);
+    historyArray.unshift(absolutePath); // Добавляем в начало
+    if (historyArray.length > 3) historyArray.pop(); // Оставляем только 3
+    return historyArray;
 }
 
-async function getEngineInfo(files, projectType, dirPath) {
-    const info = {};
-
-    switch (projectType) {
-        case 'Godot':
-            info.engine = 'Godot Engine';
-            info.version = files.some(f => f.includes('project.godot')) ? '4.x' : 'Unknown';
-            info.features = [];
-            if (files.some(f => f.endsWith('.tscn'))) info.features.push('Сцены');
-            if (files.some(f => f.endsWith('.gd'))) info.features.push('Скрипты GDScript');
-            if (files.some(f => f.endsWith('.png') || f.endsWith('.glb') || f.endsWith('.obj')))
-                info.features.push('Ассеты');
-            break;
-
-        case 'Node.js':
-            info.engine = 'Node.js';
-            try {
-                const pkgPath = path.join(dirPath, 'package.json');
-                const data = await fs.readFile(pkgPath, 'utf8');
-                const pkg = JSON.parse(data);
-                info.version = pkg.engines?.node || 'Unknown';
-            } catch {
-                info.version = 'Unknown';
-            }
-            break;
-
-        case 'Python':
-            info.engine = 'Python';
-            if (files.some(f => f.endsWith('requirements.txt'))) {
-                info.features = ['Requirements'];
-            }
-            break;
-    }
-
-    return info;
-}
-
+// --- УТИЛИТЫ ---
 function formatBytes(bytes) {
     if (bytes === 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB'];
@@ -204,412 +94,284 @@ function formatBytes(bytes) {
     return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
 }
 
-function formatDuration(ms) {
-    if (ms < 1000) return `${ms}мс`;
-    if (ms < 60000) return `${(ms / 1000).toFixed(2)}с`;
-    return `${(ms / 60000).toFixed(2)}м`;
+function getFileType(fileName) {
+    const ext = path.extname(fileName).toLowerCase();
+    for (const [category, exts] of Object.entries(CONFIG.TEXT_EXTENSIONS)) {
+        if (exts.includes(ext)) return category;
+    }
+    if (CONFIG.IGNORE_CONTENT_EXT.includes(ext)) return 'binary';
+    return 'other';
 }
 
-async function scanDirectory(dirPath, depth = 0, output = [], basePath = dirPath) {
-    if (depth > CONFIG.MAX_DEPTH) {
-        output.push(`${'  '.repeat(depth)}[Достигнута максимальная глубина рекурсии: ${CONFIG.MAX_DEPTH}]`);
-        return { output, files: [] };
-    }
+// --- УМНЫЙ ПАРСЕР СЦЕН GODOT (.tscn) ---
+function filterGodotScene(content) {
+    const lines = content.split('\n');
+    const filteredLines = [];
+    let insideSubResource = false;
 
-    try {
-        const stat = await fs.stat(dirPath);
-        if (!stat.isDirectory()) {
-            output.push(`[Путь не является директорией: ${dirPath}]`);
-            return { output, files: [] };
-        }
+    // Регулярка для визуального и физического мусора, который не нужен ИИ
+    const noiseRegex = /^(transform|position|rotation|scale|layout_mode|anchor_|offset_|grow_|theme|custom_minimum_size|size_flags_|texture|mesh|material|shape|visible|modulate|self_modulate|metadata\/_)/;
 
-        const entries = await fs.readdir(dirPath, { withFileTypes: true });
-        let allFiles = [];
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trimEnd();
+        let trimmed = line.trim();
 
-        for (let i = 0; i < entries.length; i += CONFIG.BATCH_SIZE) {
-            const batch = entries.slice(i, i + CONFIG.BATCH_SIZE);
+        if (trimmed === '') continue;
 
-            const batchResults = await Promise.all(batch.map(async (entry, batchIndex) => {
-                const entryOutput = [];
-                const fullPath = entry.path || path.join(dirPath, entry.name); // ← используем entry.path, если доступен
-                const relativePath = path.relative(basePath, fullPath);
-                const indent = '  '.repeat(depth);
-                const isLast = (i + batchIndex) === entries.length - 1;
-                const prefix = indent + (isLast ? '└──' : '├──');
-                const entryFiles = [];
-
-                if (entry.isSymbolicLink()) {
-                    projectStats.scannedSymlinks++;
-                    entryOutput.push(`${prefix} ${entry.name} [SYMLINK]`);
-                    return { output: entryOutput, files: [] };
-                }
-
-                if (entry.isDirectory()) {
-                    projectStats.scannedDirs++;
-                    projectStats.dirs.total++;
-
-                    if (CONFIG.EXCLUDE_DIRS.includes(entry.name)) {
-                        entryOutput.push(`${prefix} ${entry.name} [DIR - ИСКЛЮЧЕН]`);
-                        return { output: entryOutput, files: [] };
-                    }
-
-                    const shouldCollapse = CONFIG.COLLAPSE_DIRS.includes(entry.name);
-                    if (shouldCollapse) {
-                        let collapsedSize = 0;
-                        let collapsedFiles = 0;
-
-                        async function countCollapsed(dir) {
-                            try {
-                                const items = await fs.readdir(dir, { withFileTypes: true });
-                                for (const item of items) {
-                                    const itemPath = item.path || path.join(dir, item.name);
-                                    if (item.isSymbolicLink()) continue;
-
-                                    if (item.isDirectory()) {
-                                        await countCollapsed(itemPath);
-                                    } else {
-                                        collapsedFiles++;
-                                        entryFiles.push(path.relative(basePath, itemPath));
-                                        try {
-                                            const stats = await fs.stat(itemPath);
-                                            collapsedSize += stats.size;
-                                        } catch {}
-                                    }
-                                }
-                            } catch {}
-                        }
-
-                        await countCollapsed(fullPath);
-                        entryOutput.push(`${prefix} ${entry.name} [DIR - СВЕРНУТО] | Файлов: ${collapsedFiles} | Размер: ${formatBytes(collapsedSize)}`);
-                        return { output: entryOutput, files: entryFiles };
-                    }
-
-                    entryOutput.push(`${prefix} ${entry.name} [DIR]`);
-                    const result = await scanDirectory(fullPath, depth + 1, [], basePath);
-                    entryOutput.push(...result.output);
-                    return { output: entryOutput, files: result.files };
-                }
-
-                // Файл
-                projectStats.scannedFiles++;
-                const stats = await getFileStats(fullPath);
-
-                if (stats.error) {
-                    entryOutput.push(`${prefix} ${entry.name} [ОШИБКА: ${stats.error}]`);
-                    return { output: entryOutput, files: [relativePath] };
-                }
-
-                projectStats.size += stats.size;
-                projectStats.files.total++;
-
-                const fileType = getFileType(entry.name);
-                projectStats.files.byType[fileType] = (projectStats.files.byType[fileType] || 0) + 1;
-                projectStats.fileTypes.add(path.extname(entry.name));
-
-                if (['code', 'scripts'].includes(fileType)) {
-                    projectStats.codeFiles++;
-                    const { lineCount } = await readFileContentAndCount(fullPath);
-                    projectStats.linesOfCode += lineCount;
-                } else if (fileType === 'config') {
-                    projectStats.configFiles++;
-                } else if (fileType === 'binary') {
-                    projectStats.assetFiles++;
-                } else {
-                    projectStats.ignoredFiles++;
-                }
-
-                const typeLabels = {
-                    'code': 'КОД', 'config': 'КОНФИГ', 'markup': 'ДОКУМ',
-                    'scripts': 'СКРИПТ', 'data': 'ДАННЫЕ', 'binary': 'БИНАРНЫЙ'
-                };
-
-                const typeLabel = typeLabels[fileType] || 'ФАЙЛ';
-                let line = `${prefix} ${entry.name} [${typeLabel}]`;
-                line += ` | Размер: ${formatBytes(stats.size)}`;
-                line += ` | Права: ${stats.permissions}`;
-                line += ` | Изменен: ${stats.modified}`;
-
-                entryOutput.push(line);
-                entryFiles.push(relativePath);
-
-                const shouldShowContent = !CONFIG.IGNORE_CONTENT_EXT.some(ext =>
-                    entry.name.toLowerCase().endsWith(ext)
-                ) && stats.size <= CONFIG.MAX_FILE_SIZE && stats.size > CONFIG.MIN_FILE_SIZE_SHOW;
-
-                if (shouldShowContent) {
-                    const { content } = await readFileContentAndCount(fullPath);
-                    if (content && content.trim()) {
-                        const lines = content.split('\n');
-                        const showLines = Math.min(lines.length, CONFIG.MAX_LINES);
-
-                        entryOutput.push(`${indent}${isLast ? ' ' : '│'}   └── СОДЕРЖИМОЕ:`);
-                        entryOutput.push(`${indent}${isLast ? ' ' : '│'}       ┌${'─'.repeat(70)}`);
-
-                        for (let j = 0; j < showLines; j++) {
-                            entryOutput.push(`${indent}${isLast ? ' ' : '│'}       │ ${lines[j]}`);
-                        }
-
-                        if (lines.length > CONFIG.MAX_LINES) {
-                            entryOutput.push(`${indent}${isLast ? ' ' : '│'}       │ ...[показано ${showLines} из ${lines.length} строк]`);
-                        }
-
-                        entryOutput.push(`${indent}${isLast ? ' ' : '│'}       └${'─'.repeat(70)}`);
-                    }
-                }
-
-                return { output: entryOutput, files: entryFiles };
-            }));
-
-            for (const result of batchResults) {
-                output.push(...result.output);
-                if (result.files && Array.isArray(result.files)) {
-                    allFiles.push(...result.files);
+        // Определяем начало блоков
+        if (trimmed.startsWith('[')) {
+            // Игнорируем блоки sub_resource и resource (это 3D меши, материалы, кривые)
+            if (trimmed.startsWith('[sub_resource') || trimmed.startsWith('[resource]')) {
+                insideSubResource = true;
+                continue;
+            }
+            // Для ext_resource оставляем ТОЛЬКО скрипты (шрифты и текстуры выкидываем)
+            else if (trimmed.startsWith('[ext_resource')) {
+                if (!trimmed.includes('type="Script"')) {
+                    continue;
                 }
             }
+
+            // Если дошли до [node] или [connection], мы вышли из ресурсов
+            insideSubResource = false;
+            filteredLines.push(line);
+            continue;
         }
 
-        return { output, files: allFiles };
-    } catch (error) {
-        output.push(`[Ошибка сканирования ${dirPath}: ${error.message}]`);
-        return { output, files: [] };
+        // Если мы внутри 3D меша или материала - пропускаем всё
+        if (insideSubResource) continue;
+
+        // Если это настройка ноды, проверяем, не мусор ли это
+        if (noiseRegex.test(trimmed)) {
+            continue;
+        }
+
+        // Защита от гигантских массивов (если вдруг просочились)
+        if (trimmed.match(/(Packed\w+Array|Pool\w+Array)\s*\(/i)) {
+            filteredLines.push(`    [... Массив данных скрыт ...]`);
+            continue;
+        }
+
+        filteredLines.push(line);
     }
+
+    return filteredLines;
 }
 
-function generateProjectSummary(allFiles) {
-    const summary = [];
+// --- СКАНЕР ---
+async function scanDirectory(dirPath, depth = 0, output = [], basePath = dirPath) {
+    if (depth > CONFIG.MAX_DEPTH) return { output, files: [] };
 
-    summary.push('\n📊 СВОДКА ПРОЕКТА:');
-    summary.push('═'.repeat(70));
-    summary.push(`• Тип проекта: ${projectStats.projectType}`);
-    summary.push(`• Общий размер: ${formatBytes(projectStats.size)}`);
-    summary.push(`• Директорий: ${projectStats.dirs.total}`);
-    summary.push(`• Файлов: ${projectStats.files.total}`);
-    if (projectStats.scannedSymlinks > 0) {
-        summary.push(`• Симлинков: ${projectStats.scannedSymlinks}`);
-    }
-    summary.push(`• Строк кода: ${projectStats.linesOfCode}`);
+            try {
+                const entries = await fs.readdir(dirPath, { withFileTypes: true });
 
-    if (projectStats.engineInfo.engine) {
-        summary.push(`• Движок: ${projectStats.engineInfo.engine} ${projectStats.engineInfo.version || ''}`);
-        if (projectStats.engineInfo.features) {
-            summary.push(`• Функции: ${projectStats.engineInfo.features.join(', ')}`);
-        }
-    }
+                // Сортировка: папки потом файлы, по алфавиту
+                entries.sort((a, b) => {
+                    if (a.isDirectory() && !b.isDirectory()) return -1;
+                    if (!a.isDirectory() && b.isDirectory()) return 1;
+                    return a.name.localeCompare(b.name);
+                });
 
-    const keyFiles = allFiles
-        .filter(file => {
-            const name = file.toLowerCase();
-            const isInCollapsed = CONFIG.COLLAPSE_DIRS.some(collapsed =>
-                name.includes(`/${collapsed}/`) || name.startsWith(`${collapsed}/`)
-            );
-            if (isInCollapsed) return false;
+                let allFiles = [];
 
-            const importantFiles = [
-                'package.json', 'cargo.toml', 'pom.xml', 'build.gradle',
-                'composer.json', 'go.mod', 'requirements.txt', 'setup.py',
-                'gemfile', 'dockerfile', 'makefile', '.gitignore',
-                'readme.md', 'license'
-            ];
+                for (let i = 0; i < entries.length; i++) {
+                    const entry = entries[i];
 
-            const importantDirs = ['src/', 'lib/', 'app/', 'source/', 'scripts/', 'scenes/'];
-            const isInImportantDir = importantDirs.some(dir => name.startsWith(dir));
+                    // Игнорируем .import и другие файлы из черного списка
+                    if (CONFIG.IGNORE_FILES_ENDING.some(ending => entry.name.endsWith(ending))) {
+                        continue;
+                    }
 
-            return importantFiles.includes(path.basename(name).toLowerCase()) ||
-                isInImportantDir ||
-                name === 'project.godot' ||
-                name.includes('main.') ||
-                name.includes('app.') ||
-                name.includes('index.');
-        })
-        .slice(0, 20);
+                    const fullPath = path.join(dirPath, entry.name);
+                    const relativePath = path.relative(basePath, fullPath);
+                    const indent = '  '.repeat(depth);
+                    const isLast = i === entries.length - 1;
+                    const prefix = indent + (isLast ? '└──' : '├──');
 
-    if (keyFiles.length > 0) {
-        summary.push('\n🔍 КЛЮЧЕВЫЕ ФАЙЛЫ:');
-        summary.push('─'.repeat(40));
-        keyFiles.forEach(file => {
-            const fileType = getFileType(file);
-            const typeLabels = {
-                'code': '📝', 'config': '⚙️', 'markup': '📄',
-                'scripts': '🐚', 'data': '📊', 'binary': '📦'
-            };
-            const emoji = typeLabels[fileType] || '📄';
-            summary.push(`• ${emoji} ${file}`);
-        });
-    }
+                    if (entry.isDirectory()) {
+                        projectStats.dirs.total++;
+                        if (CONFIG.EXCLUDE_DIRS.includes(entry.name)) {
+                            // output.push(`${prefix} ${R}${entry.name}${X} [ИГНОР]`);
+                            continue;
+                        }
+                        output.push(`${prefix} ${B}${entry.name}${X} [DIR]`);
+                        const result = await scanDirectory(fullPath, depth + 1, [], basePath);
+                        output.push(...result.output);
+                        allFiles.push(...result.files);
+                        continue;
+                    }
 
-    if (CONFIG.GROUP_BY_TYPE && Object.keys(projectStats.files.byType).length > 0) {
-        summary.push('\n📦 СТАТИСТИКА ПО ТИПАМ:');
-        summary.push('─'.repeat(40));
+                    const stats = await fs.stat(fullPath);
+                    projectStats.size += stats.size;
+                    projectStats.files.total++;
 
-        const typeDisplay = {
-            'code': 'Файлы кода',
-            'config': 'Конфигурации',
-            'markup': 'Документация',
-            'scripts': 'Скрипты',
-            'data': 'Данные',
-            'binary': 'Ресурсы',
-            'other': 'Прочие'
-        };
+                    const fileType = getFileType(entry.name);
+                    const ext = path.extname(entry.name).toLowerCase();
+                    const isCodeFile = fileType === 'code' || fileType === 'scripts';
+                    const isSceneFile = ext === '.tscn';
 
-        Object.entries(projectStats.files.byType)
-            .sort((a, b) => b[1] - a[1])
-            .forEach(([type, count]) => {
-                summary.push(`• ${typeDisplay[type] || type}: ${count} файлов`);
-            });
-    }
+                    projectStats.files.byType[fileType] = (projectStats.files.byType[fileType] || 0) + 1;
+                    if (isCodeFile) projectStats.codeFiles++;
+            else if (fileType === 'binary') projectStats.assetFiles++;
 
-    return summary.join('\n');
+            let typeLabel = fileType.toUpperCase();
+                    let lineColor = fileType === 'code' ? G : fileType === 'markup' ? M : fileType === 'binary' ? W : Y;
+                    output.push(`${prefix} ${lineColor}${entry.name}${X} [${typeLabel}] | ${formatBytes(stats.size)}`);
+                    allFiles.push(relativePath);
+
+                    // ЧТЕНИЕ СОДЕРЖИМОГО
+                    const shouldShowContent = !CONFIG.IGNORE_CONTENT_EXT.includes(ext) && stats.size <= CONFIG.MAX_FILE_SIZE_CODE && stats.size > CONFIG.MIN_FILE_SIZE_SHOW;
+
+                    if (shouldShowContent) {
+                        try {
+                            const content = await fs.readFile(fullPath, 'utf8');
+                            let lines = [];
+
+                            if (isSceneFile) {
+                                lines = filterGodotScene(content); // Применяем наш хирургический парсер
+                            } else {
+                                lines = content.split('\n').filter(l => l.trim().length > 0);
+                                if (isCodeFile) projectStats.linesOfCode += lines.length;
+                            }
+
+                            const showLines = Math.min(lines.length, isSceneFile ? 500 : CONFIG.MAX_LINES_CODE);
+                            const connector = isLast ? ' ' : '│';
+
+                            if (showLines > 0) {
+                                output.push(`${indent}${connector}   ${Y}└──${X} КОНТЕНТ:`);
+                                output.push(`${indent}${connector}       ${Y}┌${X}${'─'.repeat(50)}`);
+
+                                for (let j = 0; j < showLines; j++) {
+                                    let cl = lines[j].replace(/\t/g, '    ');
+                                    if (!isCodeFile && !isSceneFile && cl.length > CONFIG.MAX_LINE_LENGTH) {
+                                        cl = cl.slice(0, CONFIG.MAX_LINE_LENGTH) + '...';
+                                    }
+                                    const color = cl.trim().startsWith('#') ? Y : W;
+                                    output.push(`${indent}${connector}       ${Y}│${X} ${color}${cl}${X}`);
+                                }
+
+                                if (lines.length > showLines) {
+                                    output.push(`${indent}${connector}       ${Y}│${X} ${C}...[скрыто ${lines.length - showLines} строк]${X}`);
+                                }
+                                output.push(`${indent}${connector}       ${Y}└${X}${'─'.repeat(50)}`);
+                            }
+                        } catch (err) {
+                            const connector = isLast ? ' ' : '│';
+                            output.push(`${indent}${connector}       ${R}[Ошибка чтения]${X}`);
+                        }
+                    }
+                }
+                return { output, files: allFiles };
+            } catch (error) {
+                output.push(`[${R}Ошибка: ${error.message}${X}]`);
+                return { output, files: [] };
+            }
 }
 
-async function generateReport(dirPath) {
-    console.log(`\n${C}🔍 Сканирование: ${dirPath}${X}`);
-    console.log('─'.repeat(80));
+async function start() {
+    // Обнуляем статистику ПЕРЕД каждым новым сканированием
+    projectStats = {
+        files: { total: 0, byType: {} }, dirs: { total: 0 },
+        size: 0, linesOfCode: 0, codeFiles: 0, assetFiles: 0
+    };
 
-    const scanStartTime = Date.now();
-    projectStats = resetStats();
-    fileCache.clear();
-    statsCache.clear();
-
-    try {
-        const stat = await fs.stat(dirPath);
-        if (!stat.isDirectory()) {
-            return { report: `❌ Путь не является директорией: ${dirPath}`, stats: projectStats };
-        }
-
-        const report = [];
-        report.push('='.repeat(80));
-        report.push(`📁 ОТЧЕТ О ПРОЕКТЕ: ${path.basename(dirPath) || dirPath}`);
-        report.push(`📅 Создан: ${new Date().toLocaleString()}`);
-        report.push(`📍 Путь: ${dirPath}`);
-        report.push('='.repeat(80));
-
-        report.push('📂 СОДЕРЖИМОЕ ПРОЕКТА:');
-        const { output: content, files: allFiles } = await scanDirectory(dirPath, 0, [], dirPath);
-        report.push(...content);
-
-        projectStats.projectType = detectProjectType(allFiles);
-        projectStats.engineInfo = await getEngineInfo(allFiles, projectStats.projectType, dirPath);
-
-        if (CONFIG.SHOW_SUMMARY) {
-            report.push(generateProjectSummary(allFiles));
-            report.push('─'.repeat(80));
-        }
-
-        report.push('⚙️ НАСТРОЙКИ СКАНЕРА:');
-        report.push(`• Исключенные папки: ${CONFIG.EXCLUDE_DIRS.slice(0, 5).join(', ')}...`);
-        report.push(`• Свернутые папки: ${CONFIG.COLLAPSE_DIRS.join(', ')}`);
-        report.push(`• Макс. глубина: ${CONFIG.MAX_DEPTH} уровней`);
-        report.push(`• Макс. размер файла: ${formatBytes(CONFIG.MAX_FILE_SIZE)}`);
-        report.push(`• Макс. строк: ${CONFIG.MAX_LINES}`);
-        report.push('─'.repeat(80));
-
-        projectStats.scanDuration = Date.now() - scanStartTime;
-
-        report.push('✅ ИТОГИ СКАНИРОВАНИЯ:');
-        report.push(`• Просканировано директорий: ${projectStats.dirs.total}`);
-        report.push(`• Найдено файлов: ${projectStats.files.total}`);
-        if (projectStats.scannedSymlinks > 0) {
-            report.push(`• Симлинков: ${projectStats.scannedSymlinks}`);
-        }
-        report.push(`• Общий размер: ${formatBytes(projectStats.size)}`);
-        report.push(`• Уникальных расширений: ${projectStats.fileTypes.size}`);
-        report.push(`• Строк кода: ${projectStats.linesOfCode}`);
-        report.push(`• Время сканирования: ${formatDuration(projectStats.scanDuration)}`);
-
-        const contentFiles = content.filter(line => line.includes('СОДЕРЖИМОЕ:')).length;
-        report.push(`• Файлов с содержимым: ${contentFiles}`);
-        report.push('='.repeat(80));
-
-        return { report: report.join('\n'), stats: projectStats };
-    } catch (error) {
-        return { report: `❌ ОШИБКА: ${error.message}`, stats: projectStats };
-    }
-}
-
-function mainMenu() {
     console.clear();
-    console.log(`
-    ${B}╔════════════════════════════════════════════════════════╗
-    ║          УМНЫЙ ГЕНЕРАТОР ОТЧЕТОВ О ПРОЕКТАХ          ║
-    ╚════════════════════════════════════════════════════════╝${X}
+    console.log(`${C}🚀 УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР ОТЧЕТОВ :)${X}\n`);
 
-    ${G}Возможности:${X}
-    • Автоопределение типа проекта (20+ типов)
-    • Группировка файлов по типам
-    • Умная фильтрация служебных папок
-    • Подсчет строк кода
-    • Подсветка ключевых файлов
-    • Детальная статистика
-    • Пакетная обработка для скорости
+    let history = await loadHistory();
 
-    ${Y}Текущие настройки:${X}
-    • Макс. размер файла: ${formatBytes(CONFIG.MAX_FILE_SIZE)}
-    • Макс. строк в файле: ${CONFIG.MAX_LINES}
-    • Макс. глубина: ${CONFIG.MAX_DEPTH} уровней
-    • Размер пакета: ${CONFIG.BATCH_SIZE} файлов
-    • Исключено папок: ${CONFIG.EXCLUDE_DIRS.length}
-    `);
+    if (history.length > 0) {
+        console.log(`${Y}Последние папки:${X}`);
+        history.forEach((p, idx) => {
+            console.log(`  ${G}${idx + 1}${X}: ${p}`);
+        });
+        console.log(`  ${G}0${X}: Ввести другой путь вручную`);
+        console.log('');
+    } else {
+        console.log(`Введите путь к папке (или нажмите Enter для текущей директории).`);
+    }
 
-    rl.question(`${G}Введите путь к проекту (или "exit" для выхода):\n>${X} `, async (input) => {
-        if (input.toLowerCase().trim() === 'exit') {
-            console.log('👋 До свидания!');
-            rl.close();
+    rl.question(`${Y}> Ваш выбор (цифра или путь): ${X}`, async (input) => {
+        let targetPath = input.trim();
+
+        // Обработка выбора из истории
+        if (history.length > 0 && /^[1-3]$/.test(targetPath)) {
+            const idx = parseInt(targetPath) - 1;
+            if (history[idx]) {
+                targetPath = history[idx];
+            } else {
+                console.log(`${R}Неверный номер.${X}`);
+                // Даем шанс попробовать снова, а не закрываем
+                setTimeout(start, 1500);
+                return;
+            }
+        } else if (targetPath === '0') {
+            targetPath = await new Promise(resolve => {
+                rl.question(`${Y}> Введите полный путь к папке: ${X}`, ans => resolve(ans.trim()));
+            });
+        }
+
+        if (!targetPath) targetPath = '.';
+
+        try {
+            const stats = await fs.stat(targetPath);
+            if (!stats.isDirectory()) throw new Error("Это не папка");
+        } catch (e) {
+            console.log(`${R}❌ Ошибка: Путь не найден или это не папка (${targetPath})${X}`);
+            setTimeout(start, 2000); // Возвращаем в меню через пару секунд
             return;
         }
 
-        const dirPath = input.trim() || '.';
-        console.log(`\n${Y}⏳ Анализирую проект...${X}`);
+        console.log(`\n${C}⏳ Сканирую: ${targetPath}...${X}`);
 
-        const { report, stats } = await generateReport(dirPath);
+        // Сохраняем в историю
+        history = addToHistory(history, targetPath);
+        await saveHistory(history);
+
+        // Генерация
+        const { output } = await scanDirectory(targetPath);
+
+        // Формируем безопасное имя для файла
+        const folderName = path.basename(path.resolve(targetPath));
+        const safeFolderName = folderName.replace(/[^a-zA-Z0-9А-Яа-яЁё_-]/g, '_');
+
+        let report = [];
+        report.push('═'.repeat(80));
+        report.push(`📁 ОТЧЕТ О ПАПКЕ: ${folderName}`);
+        report.push(`📅 Создан: ${new Date().toLocaleString()}`);
+        report.push('═'.repeat(80));
+        report.push(...output);
+
+        report.push('\n📊 СВОДКА:');
+        report.push('═'.repeat(40));
+        report.push(`• Общий размер: ${formatBytes(projectStats.size)}`);
+        report.push(`• Директорий: ${projectStats.dirs.total}`);
+        report.push(`• Файлов (всего): ${projectStats.files.total}`);
+        report.push(`• Файлов кода/скриптов: ${projectStats.codeFiles}`);
+        report.push(`• Строк чистого кода: ${projectStats.linesOfCode}`);
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        const dirName = path.basename(dirPath) || 'project';
-        const reportFileName = `project_report_${dirName}_${timestamp}.txt`;
+        const reportFileName = `report_${safeFolderName}_${timestamp}.txt`;
 
-        try {
-            await fs.writeFile(reportFileName, report, 'utf8');
-            const fileSize = formatBytes(Buffer.byteLength(report, 'utf8'));
+        const cleanReport = report.join('\n').replace(/\x1b\[\d+m/g, '');
+        await fs.writeFile(reportFileName, cleanReport, 'utf8');
 
-            console.log(`\n${G}✅ Отчет сохранен: ${reportFileName}${X}`);
-            console.log(`${G}📊 Размер отчета: ${fileSize}${X}`);
-
-            console.log(`\n${C}📋 КРАТКАЯ СТАТИСТИКА:${X}`);
-            console.log(`• Тип проекта: ${stats.projectType}`);
-            console.log(`• Всего файлов: ${stats.files.total}`);
-            console.log(`• Директорий: ${stats.dirs.total}`);
-            console.log(`• Файлов кода: ${stats.codeFiles}`);
-            console.log(`• Строк кода: ${stats.linesOfCode}`);
-            console.log(`• Размер проекта: ${formatBytes(stats.size)}`);
-            console.log(`• Время сканирования: ${formatDuration(stats.scanDuration)}`);
-
-            if (stats.engineInfo.engine) {
-                console.log(`• Движок: ${stats.engineInfo.engine}`);
-            }
-        } catch (error) {
-            console.log(`${R}❌ Ошибка сохранения: ${error.message}${X}`);
+        console.log(`\n${G}✅ Отчет сохранен: ${reportFileName}${X}`);
+        if (projectStats.linesOfCode > 0) {
+            console.log(`${C}Строк чистого кода: ${projectStats.linesOfCode}${X}`);
         }
 
-        console.log('\n' + '─'.repeat(80));
-        rl.question(`${G}Нажмите Enter для нового сканирования или введите "exit":${X} `, (answer) => {
-            if (answer.toLowerCase().trim() === 'exit') {
-                console.log('👋 До свидания!');
+        // --- ВОТ ТУТ НОВАЯ ЛОГИКА ВОЗВРАТА В МЕНЮ ---
+        rl.question(`\n${Y}> Нажми Enter, чтобы вернуться в меню (или введи 'q' для выхода): ${X}`, (answer) => {
+            if (answer.trim().toLowerCase() === 'q') {
+                console.log(`${C}Удачного кодинга! 👋${X}`);
                 rl.close();
             } else {
-                mainMenu();
+                start(); // Запускаем заново
             }
         });
     });
 }
 
-rl.on('close', () => {
-    console.log('\n✨ Работа завершена.');
-    process.exit(0);
-});
-
-process.on('SIGINT', () => {
-    console.log('\n\n👋 Завершение работы...');
-    rl.close();
-});
-
-console.log(`${C}🚀 Загрузка умного генератора отчетов...${X}`);
-setTimeout(mainMenu, 1000);
+// Поехали
+start();
